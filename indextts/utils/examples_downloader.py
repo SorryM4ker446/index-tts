@@ -121,6 +121,8 @@ def ensure_examples_available(force: bool = False) -> None:
     Call this at startup before using example files.
     """
     required = get_required_files()
+    if not force:
+        required = [name for name in required if not os.path.exists(os.path.join(_EXAMPLES_DIR, name))]
     if not required:
         return
 

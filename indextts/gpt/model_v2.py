@@ -671,11 +671,17 @@ class UnifiedVoice(nn.Module):
         attention_masks = []
         target_len = conditional_latents.shape[1] + L + 2
         for i in range(b):
-            valid_mask = (text_inputs[i] != self.stop_text_token) & (text_inputs[i] != self.start_text_token)
-            text_input = text_inputs[i][valid_mask]
+            # Long XPU synthesis has failed near this token-packing sequence.
+            # Host packing avoids that sequence; the exact runtime/driver cause
+            # is still under investigation. Embeddings and every neural network
+            # stay on the selected device. CUDA/CPU keep their original path.
+            token_row = text_inputs[i].cpu() if device.type == "xpu" else text_inputs[i]
+            valid_mask = (token_row != self.stop_text_token) & (token_row != self.start_text_token)
+            text_input = token_row[valid_mask]
             text_input = F.pad(text_input, (1, 0), value=self.start_text_token)
             text_input = F.pad(text_input, (0, 1), value=self.stop_text_token)
-            text_input_pos = torch.arange(0, text_input.size(-1), device=device)
+            text_input_pos = torch.arange(0, text_input.size(-1), device=text_input.device).to(device)
+            text_input = text_input.to(device)
             text_emb = self.text_embedding(text_input) + self.text_pos_embedding.emb(text_input_pos)
             if langs is not None and self.spk_cond_mode == "campplus":
                 text_emb += self.lang_embedding(langs[i])

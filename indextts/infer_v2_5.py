@@ -76,7 +76,8 @@ def apply_pronunciation_annotations(text: str) -> str:
 class IndexTTS2:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_bf16=False, device=None,
-            use_cuda_kernel=None,use_deepspeed=False, use_accel=False, use_torch_compile=False, use_qwen_emo=False
+            use_cuda_kernel=None,use_deepspeed=False, use_accel=False, use_torch_compile=False, use_qwen_emo=False,
+            qwen_model_dir=None
     ):
         """
         Args:
@@ -131,7 +132,8 @@ class IndexTTS2:
                 print(f">> Low-VRAM mode enabled ({total_vram_gb:.1f} GB < 10 GB), long text will be split into chunks")
 
         if use_qwen_emo:
-            self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
+            self.qwen_emo = QwenEmotion(qwen_model_dir or os.path.join(self.model_dir, self.cfg.qwen_emo_path),
+                                      device="cpu" if self.device.startswith("xpu") else None)
         else:
             self.qwen_emo = None
             print(">> QwenEmotion not loaded (use_qwen_emo=False)")
@@ -907,14 +909,23 @@ def find_most_similar_cosine(query_vector, matrix):
     return most_similar_index
 
 class QwenEmotion:
-    def __init__(self, model_dir):
+    def __init__(self, model_dir, device=None):
         self.model_dir = model_dir
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_dir,
-            torch_dtype="float16",  # "auto"
-            device_map="auto"
-        )
+        if device is not None:
+            # Keep the optional emotion classifier off the B580. CPU FP32 also
+            # avoids relying on CPU support/performance for FP16 operations.
+            dtype = torch.float32 if str(device) == "cpu" else torch.bfloat16
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_dir, torch_dtype=dtype, local_files_only=True,
+                attn_implementation="sdpa",
+            ).to(device).eval()
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_dir,
+                torch_dtype="float16",  # "auto"
+                device_map="auto"
+            )
         self.prompt = "文本情感分类"
         self.cn_key_to_en = {
             "高兴": "happy",
@@ -1021,7 +1032,7 @@ class QwenEmotion:
         # conduct text completion
         generated_ids = self.model.generate(
             **model_inputs,
-            max_new_tokens=32768,
+            max_new_tokens=512 if self.model.device.type in {"xpu", "cpu"} else 32768,
             pad_token_id=self.tokenizer.eos_token_id
         )
         output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()

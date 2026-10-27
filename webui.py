@@ -1,5 +1,6 @@
 import html
 import json
+import logging
 import os
 import sys
 import threading
@@ -32,10 +33,27 @@ parser.add_argument("--cuda_kernel", action="store_true", default=False, help="U
 parser.add_argument("--accel", action="store_true", default=False, help="Use GPT2 acceleration engine if available")
 parser.add_argument("--torch_compile", action="store_true", default=False, help="Use torch.compile to optimize s2mel if available")
 parser.add_argument("--qwen_emo", action="store_true", default=False, help="Load QwenEmotion even on a low-VRAM GPU, where it is skipped by default")
+parser.add_argument("--no-qwen-emo", action="store_true", help="Skip the optional text-to-emotion model")
+parser.add_argument("--device", default=None, help="Explicit inference device, for example xpu:0")
+parser.add_argument("--ui-language", default="Auto", help="Interface language, for example zh_CN")
 parser.add_argument("--gui_seg_tokens", type=int, default=120, help="GUI: Max tokens per generation segment")
 parser.add_argument("--share", action="store_true", default=False, help="Enable the sharing mode of Gradio WebUI for easier use on platforms such as Colab.")
 
 cmd_args = parser.parse_args()
+if cmd_args.qwen_emo and cmd_args.no_qwen_emo:
+    parser.error("--qwen_emo and --no-qwen-emo cannot be combined")
+if cmd_args.device and cmd_args.device.startswith("xpu"):
+    # Record the real Python PID before loading weights, so switching launchers
+    # can also stop a service that is still starting.
+    from pathlib import Path
+    _lab_root = Path(__file__).resolve().parent.parent
+    (_lab_root / "logs").mkdir(parents=True, exist_ok=True)
+    (_lab_root / "logs" / f"official-web-server-{cmd_args.port}.json").write_text(
+        json.dumps({"pid": os.getpid(), "port": cmd_args.port, "host": cmd_args.host,
+                    "url": f"http://{cmd_args.host}:{cmd_args.port}", "script": str(Path(__file__).resolve()),
+                    "model_dir": str(Path(cmd_args.model_dir).resolve()),
+                    "qwen_emotion_loaded": not cmd_args.no_qwen_emo,
+                    "state": "starting"}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # Validate optional acceleration dependencies early, so missing extras fail
 # at startup instead of halfway through inference.
@@ -106,7 +124,7 @@ if IS_V25:
 else:
     from indextts.infer_v2 import IndexTTS2
 
-i18n = I18nAuto(language="Auto")
+i18n = I18nAuto(language=cmd_args.ui_language)
 MODE = 'local'
 
 # Download example audio files if missing
@@ -118,16 +136,22 @@ LOW_VRAM_THRESHOLD_GB = 10.0
 def detect_vram_gb():
     import torch
 
-    if not torch.cuda.is_available():
-        return None
-    return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    if cmd_args.device and cmd_args.device.startswith("xpu"):
+        from indextts.utils.webui_xpu import require_b580
+        index = require_b580(cmd_args.device)
+        return torch.xpu.get_device_properties(index).total_memory / (1024 ** 3)
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.xpu.get_device_properties(0).total_memory / (1024 ** 3)
+    return None
 
 
 _vram_gb = detect_vram_gb()
 LOW_VRAM = _vram_gb is not None and _vram_gb < LOW_VRAM_THRESHOLD_GB
 
 HALF_PRECISION = cmd_args.fp16 or LOW_VRAM
-LOAD_QWEN_EMO = cmd_args.qwen_emo or not LOW_VRAM
+LOAD_QWEN_EMO = not cmd_args.no_qwen_emo and (cmd_args.qwen_emo or not LOW_VRAM)
 
 if LOW_VRAM:
     print(
@@ -143,6 +167,15 @@ def build_tts(use_accel=False, use_torch_compile=False):
     """Build an IndexTTS2 instance with the requested acceleration options."""
     import torch
 
+    if cmd_args.device and cmd_args.device.startswith("xpu"):
+        if not IS_V25:
+            parser.error("This B580 adapter is validated for IndexTTS 2.5")
+        if use_accel or use_torch_compile or cmd_args.deepspeed or cmd_args.cuda_kernel:
+            parser.error("CUDA extras and torch.compile are not part of the validated B580 runtime")
+        from indextts.utils.webui_xpu import XpuWebTTS
+        return XpuWebTTS(model_dir=cmd_args.model_dir, device=cmd_args.device,
+                         use_bf16=HALF_PRECISION, use_qwen_emo=LOAD_QWEN_EMO)
+
     kwargs = dict(
         model_dir=cmd_args.model_dir,
         cfg_path=os.path.join(cmd_args.model_dir, "config.yaml"),
@@ -151,9 +184,15 @@ def build_tts(use_accel=False, use_torch_compile=False):
         use_accel=use_accel,
         use_torch_compile=use_torch_compile,
         use_qwen_emo=LOAD_QWEN_EMO,
+        device=cmd_args.device,
     )
     if IS_V25:
-        use_bf16 = HALF_PRECISION and torch.cuda.is_bf16_supported()
+        use_bf16 = False
+        if HALF_PRECISION:
+            if torch.cuda.is_available():
+                use_bf16 = torch.cuda.is_bf16_supported()
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                use_bf16 = torch.xpu.is_bf16_supported()
         if HALF_PRECISION and not use_bf16:
             print(">> BF16 is not supported on this device, falling back to full precision.")
         kwargs["use_bf16"] = use_bf16
@@ -163,6 +202,25 @@ def build_tts(use_accel=False, use_torch_compile=False):
 
 
 tts = build_tts(use_accel=cmd_args.accel, use_torch_compile=cmd_args.torch_compile)
+IS_XPU_UI = bool(cmd_args.device and cmd_args.device.startswith("xpu"))
+if IS_XPU_UI:
+    from indextts.utils.webui_models import MODEL_CATALOG, installed_models, model_selection_state
+
+
+def on_model_select(profile, progress=gr.Progress()):
+    progress(0.1, desc="正在切换合成模型")
+    try:
+        tts.switch_model(profile)
+    except Exception as exc:
+        logging.exception("Official WebUI model switch failed")
+        gr.Warning(str(exc))
+    return refresh_model_selection()
+
+
+def refresh_model_selection():
+    with tts.generation_lock:
+        state = model_selection_state(tts.active_model, tts.restart_reason)
+        return gr.update(value=state["value"], interactive=state["interactive"]), state["status"]
 # 支持的语言列表
 LANGUAGES = {
     "中文": "zh_CN",
@@ -253,9 +311,13 @@ def _build_preset_data(
     repetition_penalty,
     max_mel_tokens,
     max_text_tokens_per_segment,
+    model_profile=None,
+    language=None,
 ):
     """Collect all non-audio UI values into a dictionary for preset storage."""
     return {
+        "model_profile": model_profile,
+        "language": language,
         "emo_control_method": int(emo_control_method) if emo_control_method is not None else 0,
         "emo_weight": float(emo_weight) if emo_weight is not None else 0.65,
         "emo_vector": [
@@ -297,6 +359,8 @@ def on_preset_save(
     repetition_penalty,
     max_mel_tokens,
     max_text_tokens_per_segment,
+    model_profile=None,
+    language=None,
 ):
     """Save the current UI state as a named preset."""
     name = name.strip() if name else ""
@@ -315,6 +379,7 @@ def on_preset_save(
         do_sample, top_p, top_k, temperature,
         length_penalty, num_beams, repetition_penalty,
         max_mel_tokens, max_text_tokens_per_segment,
+        model_profile, language,
     )
 
     existed = name in list_presets()
@@ -352,6 +417,9 @@ def on_preset_load(name):
         return gr.update()
 
     try:
+        profile = data.get("model_profile") or "base"
+        if IS_XPU_UI:
+            tts.switch_model(profile)
         emo_method = int(data.get("emo_control_method", 0))
         is_experimental = emo_method == 3
 
@@ -389,6 +457,9 @@ def on_preset_load(name):
             emo_choices = EMO_CHOICES_OFFICIAL
 
         return {
+            model_dropdown: gr.update(value=profile) if IS_XPU_UI else gr.skip(),
+            model_status: f"当前模型：**{MODEL_CATALOG[profile]['label']}**" if IS_XPU_UI else gr.skip(),
+            lang_dropdown: gr.update(value=data.get("language")) if IS_V25 and data.get("language") else gr.skip(),
             experimental_checkbox: gr.update(value=is_experimental),
             emo_control_method: gr.update(choices=emo_choices, value=emo_choices[emo_method]),
             prompt_audio: gr.update(value=prompt_path),
@@ -417,8 +488,7 @@ def on_preset_load(name):
             ),
         }
     except Exception as e:
-        gr.Error(f"{i18n('加载预设失败')}: {e}")
-        return gr.update()
+        raise gr.Error(f"{i18n('加载预设失败')}: {e}") from e
 
 
 def on_preset_delete(name):
@@ -571,6 +641,8 @@ def open_save_preset_modal(
     repetition_penalty,
     max_mel_tokens,
     max_text_tokens_per_segment,
+    model_profile=None,
+    language=None,
 ):
     """Open the save-preset modal and populate the preview."""
     preview = _format_preset_preview(
@@ -581,6 +653,8 @@ def open_save_preset_modal(
         length_penalty, num_beams, repetition_penalty,
         max_mel_tokens, max_text_tokens_per_segment,
     )
+    if IS_XPU_UI:
+        preview += f"\n\n**合成模型**：{MODEL_CATALOG[model_profile]['label']}\n\n**语言**：{language}"
     return (
         gr.update(visible=True),
         gr.update(value=preview),
@@ -606,6 +680,8 @@ def confirm_save_preset_from_modal(
     repetition_penalty,
     max_mel_tokens,
     max_text_tokens_per_segment,
+    model_profile=None,
+    language=None,
 ):
     """Save the preset and close the modal."""
     result = on_preset_save(
@@ -626,6 +702,8 @@ def confirm_save_preset_from_modal(
         repetition_penalty,
         max_mel_tokens,
         max_text_tokens_per_segment,
+        model_profile,
+        language,
     )
     return (
         gr.update(visible=False),  # modal
@@ -646,6 +724,7 @@ def gen_single(emo_control_method,prompt, text,
                emo_text,emo_random,
                max_text_tokens_per_segment=120,
                duration_factor=1.0,
+               model_choice=None,
                 *args, progress=gr.Progress()):
     output_path = None
     if not output_path:
@@ -698,7 +777,12 @@ def gen_single(emo_control_method,prompt, text,
     if IS_V25:
         infer_kwargs["lang"] = lang_choice or "ZH"
         infer_kwargs["duration_factor"] = float(duration_factor)
-    output = tts.infer(**infer_kwargs)
+    if IS_XPU_UI:
+        with tts.generation_lock:
+            tts.switch_model(model_choice)
+            output = tts.infer(**infer_kwargs)
+    else:
+        output = tts.infer(**infer_kwargs)
     return gr.update(value=output,visible=True)
 
 def update_prompt_audio():
@@ -713,6 +797,7 @@ def create_experimental_warning_message():
 
 with gr.Blocks(
     title=f"IndexTTS-{cmd_args.version} Demo",
+    analytics_enabled=False,
     css="""
         /* Make the voice reference audio upload area more compact. */
         #prompt_audio_compact .audio-container,
@@ -770,6 +855,18 @@ with gr.Blocks(
 
     with gr.Tab(i18n("音频生成")):
         os.makedirs("prompts", exist_ok=True)
+
+        if IS_XPU_UI:
+            model_dropdown = gr.Dropdown(choices=installed_models(), value=tts.active_model,
+                                         label="合成模型", interactive=True)
+            model_status = gr.Markdown(f"当前模型：**{MODEL_CATALOG[tts.active_model]['label']}**")
+            model_dropdown.input(on_model_select, inputs=[model_dropdown], outputs=[model_dropdown, model_status],
+                                 concurrency_id="official-xpu", concurrency_limit=1, api_name=False)
+            demo.load(refresh_model_selection, outputs=[model_dropdown, model_status],
+                      concurrency_id="official-xpu", concurrency_limit=1, api_name=False)
+        else:
+            model_dropdown = gr.State(value=None)
+            model_status = gr.State(value=None)
 
         # Voice reference section: upload audio OR load from preset
         gr.Markdown(f"### {i18n('音色参考音频')}")
@@ -1269,6 +1366,9 @@ with gr.Blocks(
 
     # Preset event bindings
     _preset_load_outputs = [
+        model_dropdown,
+        model_status,
+        lang_dropdown,
         experimental_checkbox,
         emo_control_method,
         prompt_audio,
@@ -1304,6 +1404,8 @@ with gr.Blocks(
         repetition_penalty,
         max_mel_tokens,
         max_text_tokens_per_segment,
+        model_dropdown,
+        lang_dropdown,
     ]
 
     # Audio generation tab: load from preset on dropdown change
@@ -1311,6 +1413,7 @@ with gr.Blocks(
         on_preset_load,
         inputs=[load_preset_dropdown],
         outputs=_preset_load_outputs,
+        concurrency_id="official-xpu", concurrency_limit=1,
     )
 
     # Audio generation tab: save current state as preset (opens modal)
@@ -1353,6 +1456,7 @@ with gr.Blocks(
         on_preset_load,
         inputs=[manage_preset_dropdown],
         outputs=_preset_load_outputs,
+        concurrency_id="official-xpu", concurrency_limit=1,
     )
 
     # Preset management tab: delete preset
@@ -1376,7 +1480,7 @@ with gr.Blocks(
         outputs=[load_preset_dropdown, manage_preset_dropdown],
     )
 
-    gen_button.click(gen_single,
+    generation_event = gen_button.click(gen_single,
                      inputs=[emo_control_method,prompt_audio, input_text_single,
                             lang_dropdown,
                             emo_upload, emo_weight,
@@ -1384,12 +1488,24 @@ with gr.Blocks(
                              emo_text,emo_random,
                              max_text_tokens_per_segment,
                              duration_factor,
+                             model_dropdown,
                              *advanced_params,
                      ],
-                     outputs=[output_audio])
+                     outputs=[output_audio], concurrency_id="official-xpu", concurrency_limit=1)
+    if IS_XPU_UI:
+        generation_event.then(refresh_model_selection, outputs=[model_dropdown, model_status],
+                              concurrency_id="official-xpu", concurrency_limit=1, api_name=False)
 
 
 
 if __name__ == "__main__":
-    demo.queue(20)
-    demo.launch(server_name=cmd_args.host, server_port=cmd_args.port,share=cmd_args.share)
+    if cmd_args.device and cmd_args.device.startswith("xpu"):
+        from indextts.utils.webui_xpu import add_shutdown_controls, write_server_record, OUTPUT_DIR
+        add_shutdown_controls(demo)
+        write_server_record(cmd_args.port, __file__, tts.xpu_evidence)
+        demo.queue(default_concurrency_limit=1, max_size=20)
+        demo.launch(server_name=cmd_args.host, server_port=cmd_args.port, share=False,
+                    ssr_mode=False, allowed_paths=[str(OUTPUT_DIR)])
+    else:
+        demo.queue(20)
+        demo.launch(server_name=cmd_args.host, server_port=cmd_args.port,share=cmd_args.share)
